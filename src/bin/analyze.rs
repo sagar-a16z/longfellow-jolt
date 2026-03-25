@@ -134,7 +134,7 @@ pub fn main() {
     public_inputs.extend_from_slice(&attr_digest);
 
     println!("Analyzing cycle count (with full P-256 ECDSA + SHA-256 inline)...");
-    let summary = guest::analyze_verify_mdoc(credential, public_inputs);
+    let summary = guest::analyze_verify_mdoc(jolt_sdk::PrivateInput::new(credential), public_inputs);
     let trace_len = summary.trace_len();
     println!("Trace length: {} cycles", trace_len);
     println!("Next power of 2: {}", trace_len.next_power_of_two());
