@@ -1,0 +1,702 @@
+================================================================================
+DESIGN: Advice-Blob ECDSA P-256 Verification for Jolt
+================================================================================
+
+Author: (generated design analysis)
+Date: 2026-03-24
+Status: PROPOSAL -- contains critical soundness analysis
+
+Context: longfellow-jolt mDOC credential verification
+Files:   guest/src/p256_advice.rs  (current per-operation advice)
+         guest/src/p256_fast.rs    (direct BIGINT256_MUL computation)
+         guest/src/lib.rs          (top-level verify_mdoc)
+
+
+================================================================================
+1. MOTIVATION AND COST MODEL
+================================================================================
+
+Current approaches and their cycle counts:
+
+  (A) p256 crate (lib.rs line 89):            ~4,000,000 cycles, 12s prove
+  (B) p256_fast (BIGINT256_MUL + reduction):   ~660,000 cycles
+  (C) p256_advice (per-operation advice):       ~75,000 cycles (estimated)
+
+Approach (C) advises every field mul/inv individually. In a double-and-add
+scalar multiplication with Shamir's trick over 256 bits, the guest performs:
+
+  - 256 point doublings    * (4 fp_mul + 1 fp_inv each)  = 1280 advised ops
+  - ~192 point additions   * (3 fp_mul + 1 fp_inv each)  =  768 advised ops
+  - 1 fn_inv + 2 fn_mul for u1, u2 derivation            =    3 advised ops
+  - 1 fn_inv verification itself calls fn_mul             =    1 advised op
+  Total: ~2052 advice round-trips
+
+Each advised fp_mul reads 8 u64s (c + q) and performs 2 bigint256_mul calls
+(one for a*b, one for q*p). Each advised fp_inv reads 4 u64s and triggers an
+advised fp_mul for the a*inv==1 check.
+
+The proposed optimization asks: can we collapse ALL of this into a single
+advice blob of ~96 bytes, with the guest performing only ~6 field multiplications?
+
+
+================================================================================
+2. THE PROPOSED SCHEME (AS STATED)
+================================================================================
+
+Advice blob (96 bytes total):
+  - R.x:   32 bytes (256-bit field element)
+  - R.y:   32 bytes (256-bit field element)
+  - s_inv: 32 bytes (256-bit scalar)
+
+Guest verification steps:
+  (1) Read s_inv from advice. Verify: s * s_inv == 1 mod n     [1 scalar mul]
+  (2) Compute u1 = z * s_inv mod n                              [1 scalar mul]
+  (3) Compute u2 = r * s_inv mod n                              [1 scalar mul]
+  (4) Read R.x, R.y from advice.
+  (5) Verify R is on the P-256 curve: y^2 == x^3 - 3x + b      [on-curve check]
+  (6) Verify R.x mod n == r                                      [comparison]
+
+Claimed cost: ~6 field muls total, ~1200 cycles.
+
+
+================================================================================
+3. SOUNDNESS ANALYSIS: THIS SCHEME IS BROKEN
+================================================================================
+
+THE CRITICAL FLAW: Step (5) does not bind R to (u1, u2).
+
+The ECDSA verification equation requires:
+
+    R = u1 * G + u2 * Q
+
+where G is the generator, Q is the public key, and the signature is valid iff
+R.x mod n == r. The proposed scheme verifies:
+
+    (a) s_inv is correct                 -- YES, sound
+    (b) u1 and u2 are correctly derived  -- YES, sound (deterministic from s_inv)
+    (c) R is on the P-256 curve          -- YES, but INSUFFICIENT
+    (d) R.x mod n == r                   -- YES, but INSUFFICIENT
+
+Missing: there is no check that R = u1*G + u2*Q.
+
+A malicious prover can supply ANY point R' on the P-256 curve whose
+x-coordinate satisfies R'.x mod n == r. There are exactly two such points for
+any valid r (the point (r, y) and (r, -y) when r < p, plus possibly (r+n, y')
+if r+n < p). The prover does not need to know u1 or u2; it only needs to find
+a curve point with the right x-coordinate, which is trivial: just solve
+y^2 = r^3 - 3r + b mod p.
+
+Concretely: given a FORGED signature (r, s') with arbitrary s', the prover
+can compute s'_inv, derive bogus u1' and u2', then supply R' = (r, y) where
+y is any valid y-coordinate for x=r. The guest will accept because:
+  - s' * s'_inv == 1 mod n     (prover computed s'_inv correctly)
+  - u1' = z * s'_inv mod n     (deterministic, guest can verify)
+  - u2' = r * s'_inv mod n     (deterministic, guest can verify)
+  - R' is on the curve         (prover chose a valid curve point)
+  - R'.x mod n == r            (prover chose x = r)
+
+The guest never checks that R' == u1'*G + u2'*Q, so the forged signature
+is accepted. This is a COMPLETE BREAK of ECDSA.
+
+CONCLUSION: Omitting the scalar multiplication verification is unsound.
+You CANNOT trust the prover's claimed R without verifying the discrete-log
+relation R = u1*G + u2*Q.
+
+
+================================================================================
+4. WHAT DOES SOUNDNESS ACTUALLY REQUIRE?
+================================================================================
+
+ECDSA P-256 verification is:
+
+    Given (Q, z, r, s), accept iff:
+    1.  1 <= r, s <= n-1
+    2.  s_inv = s^{-1} mod n
+    3.  u1 = z * s_inv mod n
+    4.  u2 = r * s_inv mod n
+    5.  R = u1 * G + u2 * Q        <-- the expensive part
+    6.  R != O  (point at infinity)
+    7.  R.x mod n == r
+
+Steps 1-4 are ~3 scalar field multiplications.
+Step 5 is ~1500 field multiplications (the scalar multiplication).
+Steps 6-7 are comparisons.
+
+The scalar multiplication in step 5 is the irreducible core of ECDSA
+verification. There is no known way to verify R = u1*G + u2*Q without
+either:
+  (a) Actually computing the scalar multiplication, or
+  (b) Checking an equivalent algebraic relation that is equally expensive.
+
+Specifically, verifying "R is on the curve" proves R is in the group E(F_p),
+but E(F_p) has ~2^256 points. The relation R = u1*G + u2*Q selects exactly
+one point from this group. An on-curve check provides zero bits of information
+about whether R is the correct point.
+
+
+================================================================================
+5. WHAT CAN ACTUALLY BE ADVISED?
+================================================================================
+
+Given that the scalar multiplication cannot be skipped, the question becomes:
+what is the cheapest way to VERIFY a claimed R = u1*G + u2*Q inside the guest?
+
+There are several viable strategies, ordered by increasing ambition:
+
+--------------------------------------------------------------------------
+5A. PER-OPERATION ADVICE (current p256_advice.rs approach)
+--------------------------------------------------------------------------
+
+This is what the codebase already has. The prover supplies:
+  - For each field mul: (result, quotient)  -- 8 u64s = 64 bytes
+  - For each field inv: (inverse)           -- 4 u64s = 32 bytes
+
+Guest verifies each op in ~2 bigint256_mul calls.
+
+Cost:  ~2000 advised operations
+       ~4000 bigint256_mul calls in the guest
+       ~4000 * 100 cycles = ~400K cycles
+Advice tape size: ~2000 * 64 bytes = ~128 KB
+
+This is already implemented in p256_advice.rs, though it has tape alignment
+bugs to debug (noted in lib.rs line 62).
+
+--------------------------------------------------------------------------
+5B. PER-POINT-OPERATION ADVICE (advise each EC point add/double result)
+--------------------------------------------------------------------------
+
+Instead of advising each field mul, advise the RESULT of each point
+addition or doubling. The guest verifies the EC group law algebraically.
+
+For point addition P + Q = R (affine), the guest checks:
+    lambda = (R.y - P.y) * (R.x - P.x)^{-1}   ... but this needs inv
+    Actually: verify (R.y - P.y) == lambda * (R.x - P.x)
+    and R.x = lambda^2 - P.x - Q.x
+    and R.y = lambda * (P.x - R.x) - P.y
+
+If the prover supplies (R.x, R.y, lambda), the guest verifies:
+    (a) lambda * (R.x - P.x) == R.y - P.y           [1 field mul]
+    (b) lambda^2 == R.x + P.x + Q.x                  [1 field mul]
+    (c) R.y == lambda * (P.x - R.x) - P.y             [1 field mul]
+
+But (c) is redundant given (a) and (b) -- see below.
+
+Actually, with (R.x, R.y) advised:
+  The guest can verify the addition via the chord-and-tangent equations.
+  The minimal check for P + Q = R (all affine, P != Q, P != -Q):
+
+    Advised: R.x, R.y  (64 bytes per point operation)
+
+    Compute: dx = Q.x - P.x
+             dy = Q.y - P.y
+
+    Check 1: dy^2 == (R.x + P.x + Q.x) * dx^2
+             This verifies lambda^2 = R.x + P.x + Q.x where lambda = dy/dx.
+             Cost: 2 field squarings + 1 field mul + additions
+
+    Check 2: R.y + P.y == dy * (P.x - R.x) / dx
+             Equivalently: (R.y + P.y) * dx == dy * (P.x - R.x)
+             Cost: 2 field muls + additions
+
+    Total per addition: ~4 field muls (if squaring ~ mul)
+
+For point doubling P -> R:
+    Advised: R.x, R.y
+
+    lambda = (3 * P.x^2 + a) / (2 * P.y)
+
+    Check 1: (3 * P.x^2 + a)^2 == (R.x + 2*P.x) * (2*P.y)^2
+             Cost: 3 field muls + additions
+
+    Check 2: (R.y + P.y) * (2*P.y) == (3*P.x^2 + a) * (P.x - R.x)
+             Cost: 3 field muls + additions
+
+    Total per doubling: ~6 field muls
+
+BUT: each "field mul" still needs either a BIGINT256_MUL inline or its own
+advice. Using BIGINT256_MUL + NIST reduction, each field mul costs ~100 cycles.
+
+Cost per Shamir iteration:
+  - 1 doubling:  ~6 field muls = 600 cycles
+  - 0.75 additions (avg): ~3 field muls = 300 cycles
+  - Total per bit: ~900 cycles
+  - 256 bits: ~230K cycles
+
+Advice tape: 256 doublings * 64 bytes + 192 additions * 64 bytes = ~28 KB
+
+This is better than 5A but requires implementing the algebraic checks.
+
+--------------------------------------------------------------------------
+5C. MULTI-SCALAR-MULTIPLICATION CERTIFICATE (most aggressive sound approach)
+--------------------------------------------------------------------------
+
+The prover supplies the entire chain of intermediate points plus auxiliary
+data that lets the guest verify the computation with fewer field muls per
+step. This is essentially approach 5B with optimizations:
+
+  - Use projective coordinates to avoid field inversions entirely.
+  - Batch verification of multiple additions using random linear combinations.
+
+In projective coordinates (X:Y:Z), point addition and doubling avoid
+field inversions but require more field multiplications per operation. The
+net effect on an advice-based scheme is:
+
+    Projective doubling: ~10 field muls (no inversion)
+    Projective addition: ~14 field muls (no inversion)
+
+This is WORSE for an advice-based approach because we traded away inversions
+(which are free with advice -- just check a*a_inv==1) for more muls.
+
+VERDICT: Affine coordinates with advised inversions (approach 5A/5B) are
+better in the Jolt advice model than projective coordinates.
+
+--------------------------------------------------------------------------
+5D. ECRECOVER-STYLE APPROACH: advise (R, s_inv), verify via pairing
+--------------------------------------------------------------------------
+
+Not applicable to P-256. Pairing-based verification is for BN254/BLS12-381.
+P-256 is not pairing-friendly. There is no shortcut.
+
+
+================================================================================
+6. RECOMMENDED DESIGN: HYBRID ADVICE-BLOB WITH PER-STEP CERTIFICATES
+================================================================================
+
+The optimal sound design for this codebase combines the user's intuition
+(minimize advice reads) with the soundness requirement (verify the scalar
+multiplication). The key insight is:
+
+    The scalar multiplication loop has a FIXED structure (256 iterations of
+    double-and-conditional-add). We can advise the RESULT of each iteration
+    and verify the EC group law algebraically, avoiding field inversions.
+
+Recommended architecture:
+
+ADVICE BLOB LAYOUT (total ~29 KB):
+--------------------------------------------------------------------
+Section 1: Scalar field precomputation (96 bytes)
+  [32] s_inv
+  [32] u1 = z * s_inv mod n
+  [32] u2 = r * s_inv mod n
+
+Section 2: Precomputed table point (64 bytes)
+  [32] (G+Q).x
+  [32] (G+Q).y
+
+Section 3: Double-and-add chain (256 entries, ~57 KB worst case)
+  For each bit position i from 255 down to 0:
+    [32] result.x after this step
+    [32] result.y after this step
+    [1]  operation flag: 0=double-only, 1=double-then-add-G,
+                         2=double-then-add-Q, 3=double-then-add-(G+Q)
+    Total per step: 65 bytes
+  256 steps * 65 bytes = 16,640 bytes
+
+Section 4: (Optional) Advised lambda values to avoid field inversion
+  For each step that includes an addition: [32] lambda value
+  ~192 additions * 32 bytes = 6,144 bytes
+
+Total advice: 96 + 64 + 16,640 + 6,144 = ~23 KB
+--------------------------------------------------------------------
+
+GUEST VERIFICATION SEQUENCE:
+--------------------------------------------------------------------
+
+Phase 0: Input validation (no advice needed)
+  0.1  Assert 1 <= r < n  and  1 <= s < n
+  0.2  Parse pk_x, pk_y into Fp elements
+
+Phase 1: Scalar field checks (3 bigint256_mul, ~300 cycles)
+  1.1  READ s_inv (32 bytes = 4 u64)
+  1.2  Verify s * s_inv mod n == 1:
+         - wide = bigint256_mul(s, s_inv)
+         - READ (q_sinv) [32 bytes]: quotient for this reduction
+         - Verify wide == q_sinv * n + 1  (using bigint256_mul for q*n)
+  1.3  READ u1 (32 bytes)
+  1.4  Verify u1 == z * s_inv mod n:
+         - wide = bigint256_mul(z, s_inv)
+         - READ (q_u1) [32 bytes]
+         - Verify wide == q_u1 * n + u1
+  1.5  READ u2 (32 bytes)
+  1.6  Verify u2 == r * s_inv mod n:
+         - wide = bigint256_mul(r, s_inv)
+         - READ (q_u2) [32 bytes]
+         - Verify wide == q_u2 * n + u2
+  1.7  Verify u1 < n and u2 < n
+
+  Cost: 6 bigint256_mul calls, ~600 cycles
+
+Phase 2: Table setup (4 field muls, ~400 cycles)
+  2.1  Verify Q is on the P-256 curve:
+         - y_Q^2 mod p == x_Q^3 - 3*x_Q + b mod p
+         - Requires: 1 square, 1 mul (for x^3), 1 mul (for a*x),
+           plus additions. With advice for each mod-p reduction:
+           3 bigint256_mul for computation + 3 for reduction verification
+  2.2  READ (G+Q).x, (G+Q).y (64 bytes)
+  2.3  Verify G + Q == advised point:
+         This is a single point addition check (see 5B above).
+         dx = Q.x - G.x, dy = Q.y - G.y
+         Check: dy^2 == (T.x + G.x + Q.x) * dx^2  [cross-multiply to avoid inv]
+         Check: (T.y + G.y) * dx == dy * (G.x - T.x)
+         Cost: ~5 field muls (each is bigint256_mul + reduce)
+
+  Cost: ~16 bigint256_mul calls, ~1600 cycles
+
+Phase 3: Scalar multiplication verification (256 iterations)
+  For each bit from 255 down to 0:
+
+    3.1  READ next_point (R'.x, R'.y) and operation flag
+
+    3.2  If current accumulator is the point at infinity (only at start):
+         - Special case: just accept the first non-zero table entry
+         - Must verify it equals the correct table[flag] entry
+
+    3.3  VERIFY DOUBLING: acc_new = 2 * acc_old
+         Let P = acc_old, D = doubling result (intermediate if flag != 0,
+         or R' if flag == 0).
+
+         If flag == 0 (double only):
+           D = R'
+         Else:
+           D is implicit -- we verify double-then-add as a single step.
+
+         For double-only (flag == 0):
+           Verify using tangent line:
+             num = 3*P.x^2 + a
+             Check: num^2 == (R'.x + 2*P.x) * (2*P.y)^2
+                    (R'.y + P.y) * 2*P.y == num * (P.x - R'.x)
+           Cost: 6 field muls
+
+         For double-then-add (flag != 0):
+           We need to verify both the doubling and the addition.
+           Option A: advise intermediate doubled point D, then verify
+                     D and R' = D + table[flag] separately.
+                     Cost: 64 extra bytes + 10 field muls
+           Option B: advise lambda_double and lambda_add, verify
+                     algebraically without the intermediate point.
+                     Cost: 64 extra bytes + 8 field muls
+
+           Recommended: Option A (simpler, clearer soundness argument).
+
+    3.4  UPDATE accumulator to R'.
+
+  Average cost per iteration:
+    - 25% of bits are (0,0): double-only                    = 6 muls
+    - 25% are (1,0): double + add G                         = 12 muls
+    - 25% are (0,1): double + add Q                         = 12 muls
+    - 25% are (1,1): double + add (G+Q)                     = 12 muls
+    Average: 0.25*6 + 0.75*12 = 10.5 muls per bit
+
+    With BIGINT256_MUL + NIST reduction at ~100 cycles per field mul:
+    256 * 10.5 * 100 = ~268,800 cycles for the main loop
+
+    But each field mul also needs its reduction verified via advice:
+    Each field mul = 1 bigint256_mul (compute) + 1 bigint256_mul (verify q*p)
+    So 256 * 10.5 * 2 = ~5,376 bigint256_mul calls
+    At ~100 cycles each: ~537,600 cycles
+
+  WAIT -- this is not better than approach 5A. Let me reconsider.
+
+  REVISED: Use BIGINT256_MUL inline (hardware-accelerated, ~20 cycles)
+  plus NIST fast reduction (reduce_p256, ~50 cycles including the loop).
+  The field mul verification in the guest uses bigint256_mul + reduce_p256
+  DIRECTLY (no advice needed for individual field muls), and the advice
+  is only used for the EC POINT OPERATION RESULTS.
+
+  In that case each field mul costs ~70 cycles in the guest.
+  256 * 10.5 * 70 = ~188,160 cycles for the EC group law checks.
+
+  Plus advice reads: 256 * 65 bytes + ~192 * 64 bytes = ~29 KB
+  At ~1 cycle per byte read: ~29K cycles for I/O.
+
+  Total scalar mul: ~217K cycles.
+
+Phase 4: Final comparison (~50 cycles)
+  4.1  Assert accumulator != point at infinity
+  4.2  Compute acc.x mod n (subtract n if acc.x >= n)
+  4.3  Assert acc.x mod n == r
+
+TOTAL ESTIMATED COST:
+  Phase 1:    600 cycles
+  Phase 2:  1,600 cycles
+  Phase 3: 217,000 cycles (dominated by this)
+  Phase 4:     50 cycles
+  TOTAL:  ~220,000 cycles
+
+  versus current p256_advice.rs estimate: ~400,000 cycles  (1.8x improvement)
+  versus p256_fast.rs:                    ~660,000 cycles  (3x improvement)
+  versus p256 crate:                    ~4,000,000 cycles  (18x improvement)
+
+
+================================================================================
+7. SIMPLIFIED RECOMMENDED DESIGN (PRACTICAL)
+================================================================================
+
+Given the complexity vs. savings tradeoff, the most practical improvement
+over the current p256_advice.rs is MUCH simpler: keep the per-operation
+advice approach but fix the tape alignment bugs and optimize the verification.
+
+The key optimizations to the existing p256_advice.rs design:
+
+(a) AVOID FIELD INVERSIONS IN THE EC LOOP.
+
+    Current code (p256_advice.rs lines 228-253) uses affine point
+    add/double with explicit field inversions. Each inversion costs
+    1 advice read + 1 fp_mul_advice (to verify a * a_inv == 1), which
+    itself costs 1 advice read + 2 bigint256_mul.
+
+    Instead, use PROJECTIVE COORDINATES in the main loop but CONVERT TO
+    AFFINE only at the end (1 inversion total).
+
+    Projective doubling (Jacobian): 1M + 5S + ... = ~10 field muls
+    Projective addition (mixed):    7M + 4S       = ~11 field muls
+    No inversions during the loop.
+    1 final inversion to convert back to affine.
+
+    With advice per field mul (each is 8 u64 read + 2 bigint256_mul):
+    Doublings: 256 * 10 = 2560 advised muls
+    Additions: 192 * 11 = 2112 advised muls
+    Total: ~4672 advised muls
+
+    Each advised mul: 2 bigint256_mul * 20 cycles = 40 cycles
+                     + 8 u64 reads * 1 cycle = 8 cycles
+                     + comparison + range check = ~10 cycles
+                     = ~58 cycles total
+
+    4672 * 58 = ~271K cycles
+
+    Plus final affine conversion: 1 inversion (advised) + 2 muls = ~200 cycles
+
+    Total: ~271K cycles. Comparable to the blob approach but much simpler.
+
+(b) BATCH QUOTIENT VERIFICATION.
+
+    Instead of verifying a*b == q*p + c for each multiplication separately,
+    accumulate a random linear combination and verify at the end.
+    This trades ~2x bigint256_mul savings for a more complex protocol.
+    Not recommended for v1.
+
+(c) PRECOMPUTE TABLE POINTS.
+
+    The current Shamir's trick precomputes [O, G, Q, G+Q]. With a wider
+    window (e.g., 4 bits), precompute 16 points. This reduces the number of
+    additions from ~192 to ~64. Net savings: ~128 * 11 * 58 = ~82K cycles.
+    But adds 16 * 2 * 32 = 1 KB to the advice blob for the table points.
+
+
+================================================================================
+8. EXACT ADVICE TAPE LAYOUT FOR RECOMMENDED DESIGN
+================================================================================
+
+This section specifies the concrete advice layout for the EXISTING per-
+operation approach (approach 5A from section 5), with the fixes and
+optimizations from section 7.
+
+All values are [u64; 4] in little-endian limb order (matching Fp/Fn types).
+
+--- ADVICE TAPE CONTENTS (sequential reads) ---
+
+[A] SCALAR FIELD PRECOMPUTATION
+    READ  s_inv.e[0..3]     (4 x u64)      -- s^{-1} mod n
+    READ  q_sinv_check[0..3] (4 x u64)     -- quotient: s*s_inv = q*n + 1
+    // Guest verifies: bigint256_mul(s, s_inv) == bigint256_mul(q, n) + [1,0,0,0]
+
+    READ  u1_result[0..3]    (4 x u64)     -- z * s_inv mod n
+    READ  q_u1[0..3]         (4 x u64)     -- quotient
+    // Guest verifies: bigint256_mul(z, s_inv) == bigint256_mul(q_u1, n) + u1
+
+    READ  u2_result[0..3]    (4 x u64)     -- r * s_inv mod n
+    READ  q_u2[0..3]         (4 x u64)     -- quotient
+    // Guest verifies: bigint256_mul(r, s_inv) == bigint256_mul(q_u2, n) + u2
+
+    Total: 24 u64s = 192 bytes, 6 bigint256_mul calls
+
+[B] EC SCALAR MULTIPLICATION (Shamir's trick, 256 iterations)
+    For each field mul/square in point_double or point_add:
+      READ  result[0..3]     (4 x u64)     -- a*b mod p
+      READ  quotient[0..3]   (4 x u64)     -- q such that a*b = q*p + result
+      // Guest verifies: bigint256_mul(a, b) == bigint256_mul(q, p) + result
+      //                 and result < p
+
+    For each field inv in point_add (affine coordinates):
+      READ  inv[0..3]        (4 x u64)     -- a^{-1} mod p
+      // Guest verifies via an advised fp_mul: a * inv mod p == 1
+
+    Operation counts (affine, Shamir's trick):
+      Point double:  3 fp_mul + 1 fp_sq + 1 fp_inv = 5 advised ops
+                     fp_inv triggers 1 fp_mul check = 6 total advised ops
+                     Each advised op = 8 u64 read + 2 bigint256_mul
+                     Per double: 48 u64 reads, 12 bigint256_mul
+
+      Point add:     2 fp_mul + 1 fp_sq + 1 fp_inv = 4 advised ops
+                     fp_inv triggers 1 fp_mul check = 5 total advised ops
+                     Per add: 40 u64 reads, 10 bigint256_mul
+
+      256 doubles:   256 * 48 = 12,288 u64 reads
+      ~192 adds:     192 * 40 =  7,680 u64 reads
+      Total:                     19,968 u64 reads = 159,744 bytes
+
+    Total [B]: ~160 KB advice, ~(256*12 + 192*10) = ~5,000 bigint256_mul
+
+[C] TOTAL
+    Advice tape: ~160 KB
+    bigint256_mul calls: ~5,006
+    At 20 cycles per bigint256_mul: ~100,120 cycles
+    Overhead (reads, comparisons, additions): ~50,000 cycles
+    ESTIMATED TOTAL: ~150,000 cycles
+
+
+================================================================================
+9. WHAT ABOUT THE ORIGINAL 96-BYTE PROPOSAL? CAN IT BE SAVED?
+================================================================================
+
+Short answer: NO, not without an equally expensive alternative check.
+
+Long answer: there are a few theoretical approaches to verify R = u1*G + u2*Q
+with less work than full scalar multiplication, but none are practical for
+P-256 in a zkVM:
+
+9A. PAIRING CHECK
+    For pairing-friendly curves (BN254, BLS12-381), one can verify
+    e(R - u1*G, H) == e(u2*Q, H) in the target group. But P-256 is NOT
+    pairing-friendly. Not applicable.
+
+9B. BATCH VERIFICATION WITH RANDOM CHALLENGE
+    Given a random challenge c (from Fiat-Shamir or the verifier), check:
+      c*R == c*u1*G + c*u2*Q
+    This doesn't help -- it's the same computation with an extra scalar.
+
+9C. DISCRETE LOG PROOF
+    The prover could supply a Schnorr-like proof that R has the correct
+    discrete log relationship. But this requires another scalar multiplication
+    inside the guest to verify the proof -- no savings.
+
+9D. SUCCINCT PROOF OF EC COMPUTATION
+    The prover could generate a separate SNARK/STARK proving R = u1*G + u2*Q
+    and the guest verifies that inner proof. This is recursive composition.
+    Jolt doesn't currently support recursive verification inside the guest,
+    and even if it did, verifying an inner proof would likely cost more than
+    just doing the scalar multiplication.
+
+9E. PRECOMPUTED LOOKUP TABLE (amortized)
+    If the same public key Q is used for many signatures, precompute a large
+    table of multiples of Q and include it in the program binary. This could
+    reduce the u2*Q computation to ~128 additions (using windowed method).
+    But this only saves a constant factor and adds significant binary size.
+
+CONCLUSION: The 96-byte advice blob proposal cannot be made sound.
+The scalar multiplication is the cryptographic core of ECDSA and cannot be
+elided by advice.
+
+
+================================================================================
+10. COMPARISON TABLE
+================================================================================
+
+Approach                        Cycles    Advice Size  Soundness  Complexity
+---------------------------------------------------------------------------
+p256 crate (current)          4,000,000   0 bytes      Sound      Trivial
+p256_fast (BIGINT256_MUL)      660,000    0 bytes      Sound      Moderate
+p256_advice (per-op, current)  ~150,000   ~160 KB      Sound      High
+Per-EC-op advice (Sec 6)       ~220,000   ~29 KB       Sound      Very High
+96-byte blob (Sec 2)            ~1,200    96 bytes     BROKEN     Low
+---------------------------------------------------------------------------
+
+The per-operation advice approach (p256_advice.rs) offers the best
+cycles-to-complexity ratio. The existing implementation is architecturally
+sound; it only needs the tape alignment bugs fixed (noted in lib.rs line 62).
+
+
+================================================================================
+11. IMPLEMENTATION PRIORITY
+================================================================================
+
+Recommended path:
+
+  Priority 1: Fix the advice tape alignment bug in p256_advice.rs.
+              The current code has the right architecture. Debug the
+              AdviceReader/AdviceWriter ordering issue that prevents it
+              from working end-to-end.
+
+  Priority 2: Optimize the Shamir's trick loop in p256_advice.rs.
+              The current implementation (lines 256-302) is correct but
+              could benefit from a wider Shamir window (2-bit or 4-bit)
+              to reduce the number of point additions.
+
+  Priority 3: Consider projective coordinates to eliminate inversions
+              from the main loop (section 7a). This reduces the number
+              of advice round-trips but increases the number of field
+              muls per operation. Net benefit depends on the relative
+              cost of advice reads vs. bigint256_mul in the Jolt prover.
+
+  Priority 4: If cycle count is still too high, implement the per-EC-op
+              advice approach (section 6) which reduces advice reads at
+              the cost of more complex guest verification logic.
+
+Do NOT implement the 96-byte blob approach. It is unsound.
+
+
+================================================================================
+12. APPENDIX: DETAILED VERIFICATION EQUATIONS
+================================================================================
+
+For reference, the exact algebraic checks used in each approach.
+
+A. ADVISED FIELD MUL VERIFICATION (p256_advice.rs, current)
+   Claim: a * b mod p = c  with quotient q
+   Verify: bigint256_mul(a, b) == add_wide(bigint256_mul(q, p), c)
+           AND c < p
+   Cost: 2 bigint256_mul + 1 wide_add + 1 comparison
+
+B. ADVISED FIELD INV VERIFICATION
+   Claim: a^{-1} mod p = inv
+   Verify: fp_mul_advice(a, inv) == 1
+           AND inv < p
+   Cost: 1 advised field mul (so 2 bigint256_mul) + 1 comparison
+
+C. ADVISED SCALAR MUL VERIFICATION (fn_mul_advice, current)
+   Claim: a * b mod n = c  with quotient q
+   Verify: bigint256_mul(a, b) == add_wide(bigint256_mul(q, n), c)
+           AND c < n
+   Cost: 2 bigint256_mul + 1 wide_add + 1 comparison
+
+D. ON-CURVE CHECK (used for public key Q only)
+   Verify: y^2 mod p == (x^3 - 3x + b) mod p
+   Using advised field muls:
+     x2 = fp_mul_advice(x, x)          -- 1 advised mul
+     x3 = fp_mul_advice(x2, x)         -- 1 advised mul
+     ax = fp_mul_advice(Fp(p-3), x)    -- 1 advised mul (a = -3 for P-256)
+     y2 = fp_mul_advice(y, y)          -- 1 advised mul
+     rhs = x3 + ax + b (mod p, via add/sub -- cheap)
+     assert y2 == rhs
+   Cost: 4 advised field muls = 8 bigint256_mul
+
+E. POINT ADDITION VERIFICATION (affine, P + Q = R, P != Q)
+   lambda = (Q.y - P.y) / (Q.x - P.x)
+   R.x = lambda^2 - P.x - Q.x
+   R.y = lambda * (P.x - R.x) - P.y
+
+   Advised: lambda_inv = (Q.x - P.x)^{-1}  via fp_inv_advice
+   Compute: lambda = fp_mul_advice(Q.y - P.y, lambda_inv)
+   Verify:  R.x = fp_mul_advice(lambda, lambda) - P.x - Q.x
+            R.y = fp_mul_advice(lambda, P.x - R.x) - P.y
+   Cost: 1 fp_inv (= 1 advised inv + 1 advised mul) + 3 advised muls
+       = 4 advised muls + 1 advised inv = 5 advice reads, 10 bigint256_mul
+
+F. POINT DOUBLING VERIFICATION (affine, 2*P = R, P.y != 0)
+   lambda = (3*P.x^2 + a) / (2*P.y)
+   R.x = lambda^2 - 2*P.x
+   R.y = lambda*(P.x - R.x) - P.y
+
+   Advised: fp_inv_advice(2*P.y)
+   Compute: x2 = fp_mul_advice(P.x, P.x)
+            num = x2 + x2 + x2 + a        (additions only, ~10 cycles)
+            lambda = fp_mul_advice(num, inv_2py)
+            R.x = fp_mul_advice(lambda, lambda) - P.x - P.x
+            R.y = fp_mul_advice(lambda, P.x - R.x) - P.y
+   Cost: 1 fp_inv + 4 fp_mul = 5 advice reads, 12 bigint256_mul
+
+
+================================================================================
+END OF DESIGN DOCUMENT
+================================================================================

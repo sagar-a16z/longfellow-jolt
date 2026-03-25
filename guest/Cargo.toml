@@ -1,0 +1,17 @@
+[package]
+name = "guest"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+guest = []
+compute_advice = []
+
+[dependencies]
+jolt = { package = "jolt-sdk", git = "https://github.com/a16z/jolt", features = ["guest-std", "zk"] }
+jolt-inlines-sha2 = { git = "https://github.com/a16z/jolt" }
+jolt-inlines-bigint = { git = "https://github.com/a16z/jolt" }
+jolt-inlines-p256 = { path = "../jolt-inlines-p256" }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+ecdsa = { version = "0.16", default-features = false, features = ["verifying"] }
+serde = { version = "1", features = ["derive"] }
