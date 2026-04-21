@@ -9,8 +9,30 @@
 extern crate jolt_inlines_bigint;
 extern crate jolt_inlines_p256;
 
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use std::time::Instant;
 use tracing::info;
+
+fn get_rss_mb() -> usize {
+    use std::process::Command;
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    out.trim().parse::<usize>().unwrap_or(0) / 1024
+}
+
+fn get_peak_rss_mb() -> usize {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    ru.ru_maxrss as usize / (1024 * 1024) // macOS ru_maxrss is bytes
+}
 
 /// The first mDOC test example from mdoc_examples.h.
 /// This is a real Google IACA-signed mDOC with one attribute (age_over_18).
@@ -378,6 +400,8 @@ pub fn main() {
 
     // ---- Jolt proving pipeline ----
 
+    info!("RSS at start: {} MB", get_rss_mb());
+
     info!("Step 1: Compiling guest to RISC-V...");
     let target_dir = "/tmp/jolt-guest-targets";
     let mut program = guest::compile_verify_mdoc(target_dir);
@@ -387,14 +411,15 @@ pub fn main() {
         .expect("preprocessing failed");
     let prover_prep = guest::preprocess_prover_verify_mdoc(shared.clone());
     let verifier_setup = prover_prep.generators.to_verifier_setup();
-    // Enable BlindFold ZK: the credential is a PrivateInput whose contents
-    // are cryptographically hidden from the verifier.
     let blindfold_setup = prover_prep.blindfold_setup();
     let verifier_prep =
         guest::preprocess_verifier_verify_mdoc(shared, verifier_setup, Some(blindfold_setup));
 
     let prove = guest::build_prover_verify_mdoc(program, prover_prep);
     let verify = guest::build_verifier_verify_mdoc(verifier_prep);
+
+    info!("RSS after preprocessing: {} MB", get_rss_mb());
+    info!("Peak RSS before prove: {} MB", get_peak_rss_mb());
 
     info!("Step 3: Proving mDOC verification (ZK mode, SHA-256 inline + P-256 ECDSA)...");
     let t = Instant::now();
@@ -404,15 +429,17 @@ pub fn main() {
         public_inputs.clone(),
     );
     let prove_time = t.elapsed();
+    info!("RSS after prove: {} MB", get_rss_mb());
+    info!("Peak RSS after prove: {} MB", get_peak_rss_mb());
     info!("Prover runtime: {:.2} s", prove_time.as_secs_f64());
     info!("Output (1=valid, 0=invalid): {}", output);
     info!("Guest panicked: {}", io.panic);
 
     info!("Step 4: Verifying ZK proof...");
     let t = Instant::now();
-    // Verifier does NOT see the credential — only public_inputs, output, and the proof
     let is_valid = verify(public_inputs, output, io.panic, proof);
     let verify_time = t.elapsed();
+    info!("RSS after verify: {} MB", get_rss_mb());
     info!("Verifier runtime: {:.2} s", verify_time.as_secs_f64());
     info!("Proof valid: {}", is_valid);
 
